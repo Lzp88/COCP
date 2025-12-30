@@ -1,0 +1,675 @@
+﻿// Pzigzagbipslazysafe1.cpp : 此文件包含 "main" 函数。程序执行将在此处开始并结束。
+//
+
+// powell_cocp1_lazy.cpp  (generic fixes: Int2 interpolation + local refine + Powell restart)
+// Powell maximize(base_objective) + COCP1 line search (bisection + lazy presampling for Int1)
+// - line search internal uses f_value = pow(base, POWER_N)
+// - Powell compares/stops using base_objective
+//
+// Key generic improvements (NOT Rosenbrock-specific):
+//   A) Int2 uses Int1 interpolation (no extra true evaluations) -> huge sample reduction
+//   B) Powell restart when a full iteration makes no move (||dx||=0 and Δbase=0) -> avoid direction set stall
+//   C) small local golden-section refinement around coarse-best -> find small-step improvements generically
+//
+// g++ -O2 -std=c++17 powell_cocp1_lazy.cpp -o run && ./run
+//to run faster: g++ -O3 -march=native -fopenmp Pzigzagbipslazysafe1.cpp -o main
+
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
+#include <vector>
+#include <random>
+#include <chrono>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ====================== DIM / DOMAIN ======================
+#define DIM 63
+#define Max_iters 100
+// 目标函数选择：0=Rosenbrock, 1=Rastrigin, 2=Schwefel, 3=Ackley, 4=LogPotential
+#define OBJ_TYPE 3
+
+#if OBJ_TYPE == 0
+static constexpr double KBOX = 2.0;      // Rosenbrock 常用 [-2,2]
+#elif OBJ_TYPE == 1
+static constexpr double KBOX = 5.12;     // Rastrigin 常用 [-5.12,5.12]
+#elif OBJ_TYPE == 2
+static constexpr double KBOX = 500.0;    // Schwefel 常用 [-500,500]
+#elif OBJ_TYPE == 3
+static constexpr double KBOX = 5.0;      // Ackley 常用 [-5,5]
+#else
+static constexpr double KBOX = 2.0;      // logpotential
+#endif
+
+using Vec = std::array<double, DIM>;
+
+// ====================== COCP1 (bisection + lazy) params ======================
+static constexpr double COCP1_DELTA = 0.04;     // δ
+static constexpr int    COCP1_C = 10;       // Int2 uses i=-C..C (21 pts)
+static constexpr double COCP1_TOL_S = COCP1_DELTA;  // bisection stop on interval length
+static constexpr int    COCP1_MAX_BISECT = 60;
+static constexpr double COCP1_HMIN_FACTOR = 8.0; // h_min = sqrt(delta)/HMIN_FACTOR
+
+// ====================== Objective ==========================
+static long long cnt = 0; // counts TRUE evaluations (eval_line_pow calls)
+static const double POWER_N = 5.0;  // power-lift exponent
+
+static inline double dotv(const Vec& a, const Vec& b) {
+    double s = 0; for (int i = 0; i < DIM; i++) s += a[i] * b[i]; return s;
+}
+static inline double normv(const Vec& a) { return std::sqrt(dotv(a, a)); }
+static inline Vec addv(const Vec& a, const Vec& b, double sb = 1.0) {
+    Vec r; for (int i = 0; i < DIM; i++) r[i] = a[i] + sb * b[i]; return r;
+}
+static inline Vec subv(const Vec& a, const Vec& b) {
+    Vec r; for (int i = 0; i < DIM; i++) r[i] = a[i] - b[i]; return r;
+}
+static inline Vec normalize(Vec v) {
+    double n = normv(v);
+    if (n < 1e-18) return v;
+    for (int i = 0; i < DIM; i++) v[i] /= n;
+    return v;
+}
+
+// base objective: MUST be nonnegative; out-of-box => 0
+static inline double base_objective(const Vec& x) {
+    for (int i = 0; i < DIM; i++) {
+        if (x[i] < -KBOX || x[i] > KBOX) return 0.0;
+    }
+
+#if OBJ_TYPE == 0
+    // Inverted Rosenbrock (max near (1,1,...))
+    double rosen = 0.0;
+    for (int i = 0; i < DIM / 2; i++) {
+        double x0 = x[2 * i];
+        double x1 = x[2 * i + 1];
+        double t1 = x1 - x0 * x0;
+        double t2 = 1.0 - x0;
+        rosen += 100.0 * t1 * t1 + t2 * t2;
+    }
+    double height = 90008.5 - rosen;
+    return (height > 0.0 ? height : 0.0);
+
+#elif OBJ_TYPE == 1
+    // Inverted Rastrigin (global max at 0)
+    const double A = 10.0;
+    double val = A * DIM;
+    for (int i = 0; i < DIM; i++) {
+        val += (x[i] * x[i] - A * std::cos(2.0 * M_PI * x[i]));
+    }
+    double height = 8990888.5 - val;
+    return (height > 0.0 ? height : 0.0);
+
+#elif OBJ_TYPE == 2
+    // Inverted Schwefel (global max near 420.9687,...)
+    double s = 0.0;
+    for (int i = 0; i < DIM; i++) {
+        double xi = x[i];
+        s += -xi * std::sin(std::sqrt(std::fabs(xi)));
+    }
+    double height = 2000.0 - s;
+    return (height > 0.0 ? height : 0.0);
+
+#elif OBJ_TYPE == 3
+    // Inverted Ackley (global max at 0)
+    double sum1 = 0.0, sum2 = 0.0;
+    for (int i = 0; i < DIM; i++) {
+        sum1 += x[i] * x[i];
+        sum2 += std::cos(2.0 * M_PI * x[i]);
+    }
+    double a = 20.0, b = 0.2;
+    double ack = -a * std::exp(-b * std::sqrt(sum1 / DIM))
+        - std::exp(sum2 / DIM) + a + std::exp(1.0);
+    double height = 50.0 - ack;
+    return (height > 0.0 ? height : 0.0);
+
+#else
+    // log potential: like peak near (0.5,0.5,...)
+    double sum_log = 0.0;
+    for (int i = 0; i < DIM; i++) {
+        double xi = x[i];
+        double t1 = (xi - 0.5);
+        double t2 = (xi + 0.5);
+        sum_log += std::log(t1 * t1 + 0.0001) + std::log(t2 * t2 + 0.01);
+    }
+    double Cc = 1.5;
+    double height = Cc - sum_log;
+    return (height > 0.0 ? height : 0.0);
+#endif
+}
+
+// Evaluate along line: returns pow(base, POWER_N), also outputs base.
+// This is the ONLY place we count samples (TRUE objective calls).
+static inline double eval_line_pow(const Vec& x0, const Vec& v_unit, double s, double* out_base) {
+    ++cnt;
+    Vec x;
+    for (int i = 0; i < DIM; i++) x[i] = x0[i] + s * v_unit[i];
+
+    double b = base_objective(x);
+    if (out_base) *out_base = b;
+    if (b <= 0.0) return 0.0;
+    return std::pow(b, POWER_N);
+}
+
+// ====================== sampling breakdown ======================
+static long long f_calls_int1_init = 0;
+static long long f_calls_int1_refine = 0;
+static long long f_calls_misc = 0;
+
+// ====================== COCP1 bisection + lazy Int1 ======================
+struct AdaptiveInt1 {
+    double L = 0.0, U = 0.0;
+    std::vector<double> xs;     // sorted
+    std::vector<double> fs;     // f^N along line
+    std::vector<double> prefix; // trapezoid prefix
+
+    void rebuild_prefix() {
+        int n = (int)xs.size();
+        prefix.assign(n, 0.0);
+        for (int j = 1; j < n; ++j) {
+            double dx = xs[j] - xs[j - 1];
+            prefix[j] = prefix[j - 1] + 0.5 * (fs[j - 1] + fs[j]) * dx;
+        }
+    }
+
+    template <class EvalInit>
+    void build_coarse(double l, double u, double h0, EvalInit eval_init) {
+        L = l; U = u;
+        xs.clear(); fs.clear(); prefix.clear();
+        if (U <= L) { xs = { L,U }; fs = { 0,0 }; rebuild_prefix(); return; }
+        if (h0 <= 0) h0 = (U - L) / 8.0;
+        int M = (int)std::ceil((U - L) / h0);
+        int P = M + 1;
+        xs.reserve(P);
+        fs.reserve(P);
+        for (int j = 0; j < P; ++j) {
+            double x = L + j * h0;
+            if (x > U) x = U;
+            xs.push_back(x);
+            fs.push_back(eval_init(x));
+        }
+        xs.back() = U;
+        rebuild_prefix();
+    }
+
+    int size() const { return (int)xs.size(); }
+
+    int left_index(double x) const {
+        auto it = std::upper_bound(xs.begin(), xs.end(), x);
+        int j = (int)(it - xs.begin()) - 1;
+        if (j < 0) j = 0;
+        if (j >= (int)xs.size() - 1) j = (int)xs.size() - 2;
+        return j;
+    }
+
+    template <class EvalRefine>
+    void refine_interval(int j, EvalRefine eval_ref) {
+        double xl = xs[j], xr = xs[j + 1];
+        double xm = 0.5 * (xl + xr);
+        if (!(xm > xl && xm < xr)) return;
+        double fm = eval_ref(xm);
+        xs.insert(xs.begin() + (j + 1), xm);
+        fs.insert(fs.begin() + (j + 1), fm);
+        rebuild_prefix();
+    }
+
+    template <class EvalRefine>
+    void ensure_local_resolution(double x, double target_h, EvalRefine eval_ref, int max_ref = 50) {
+        if (x <= L || x >= U) return;
+        if (target_h <= 0) return;
+        for (int r = 0; r < max_ref; ++r) {
+            int j = left_index(x);
+            double len = xs[j + 1] - xs[j];
+            if (len <= target_h) break;
+            refine_interval(j, eval_ref);
+        }
+    }
+
+    double interp_val(double x) const {
+        if (x <= L) return fs.front();
+        if (x >= U) return fs.back();
+        int j = left_index(x);
+        double xl = xs[j], xr = xs[j + 1];
+        double fl = fs[j], fr = fs[j + 1];
+        double a = (x - xl) / (xr - xl);
+        return (1.0 - a) * fl + a * fr;
+    }
+
+    double integral_to(double x) const {
+        if (x <= L) return 0.0;
+        if (x >= U) return prefix.back();
+        int j = left_index(x);
+        double xl = xs[j];
+        double fl = fs[j];
+        double fx = interp_val(x);
+        double seg = 0.5 * (fl + fx) * (x - xl);
+        return prefix[j] + seg;
+    }
+
+    double total_integral() const { return prefix.back(); }
+};
+
+struct LineSearchResult {
+    Vec x_best;
+    double base_best = 0.0;
+    double s_best = 0.0;
+    int bisection_iters = 0;
+};
+
+// compute feasible s range so that x0 + s*v stays in [-KBOX, KBOX]^DIM
+static inline bool feasible_s_interval(const Vec& x0, const Vec& v, double& outL, double& outU) {
+    double L = -1e300, U = 1e300;
+    for (int i = 0; i < DIM; i++) {
+        double vi = v[i];
+        double xi = x0[i];
+        if (std::fabs(vi) < 1e-18) {
+            if (xi < -KBOX || xi > KBOX) return false;
+            continue;
+        }
+        double t1 = (-KBOX - xi) / vi;
+        double t2 = (KBOX - xi) / vi;
+        double lo = std::min(t1, t2);
+        double hi = std::max(t1, t2);
+        L = std::max(L, lo);
+        U = std::min(U, hi);
+        if (L > U) return false;
+    }
+    outL = L; outU = U;
+    return (outU - outL) > 1e-15;
+}
+
+static LineSearchResult LineSearch_COCP1_BisectLazy(const Vec& x0, const Vec& v_unit) {
+    LineSearchResult res;
+    res.x_best = x0;
+    res.base_best = base_objective(x0);
+    res.s_best = 0.0;
+
+    double SL, SU;
+    if (!feasible_s_interval(x0, v_unit, SL, SU)) {
+        return res;
+    }
+
+    // Helpers to evaluate and update best without extra calls
+    auto eval_and_update = [&](double s, int tag)->double {
+        double b = 0.0;
+        double p = eval_line_pow(x0, v_unit, s, &b);
+        if (tag == 0) f_calls_int1_init++;
+        else if (tag == 1) f_calls_int1_refine++;
+        else f_calls_misc++;
+
+        if (p > 0.0 && b >= 0.0) {
+            if (b > res.base_best) {
+                res.base_best = b;
+                res.s_best = s;
+                res.x_best = addv(x0, v_unit, s);
+            }
+        }
+        return p;
+        };
+
+    // Build coarse Int1 table with h0 = min(sqrt(delta), (SU-SL)/8)
+    double width = SU - SL;
+    double h0 = std::sqrt(COCP1_DELTA);
+    h0 = std::min(h0, width / 8.0);
+    h0 = std::max(h0, 1e-6);
+
+    AdaptiveInt1 int1;
+    int1.build_coarse(SL, SU, h0, [&](double s) {
+        return eval_and_update(s, 0); // Int1 init
+        });
+
+    // ---- Generic local refinement around coarse-best (golden section) ----
+    // This helps find small-step improvements even when coarse grid misses them.
+    auto local_golden_refine = [&](double center, double radius) {
+        double lo = std::max(SL, center - radius);
+        double hi = std::min(SU, center + radius);
+        if (!(hi > lo + 1e-12)) return;
+
+        const double gr = 0.6180339887498948482; // golden ratio conjugate
+        double c = hi - gr * (hi - lo);
+        double d = lo + gr * (hi - lo);
+        double fc = eval_and_update(c, 3);
+        double fd = eval_and_update(d, 3);
+
+        // fixed small iterations (generic + cheap)
+        for (int it = 0; it < 12; ++it) {
+            if (fc < fd) {
+                lo = c;
+                c = d; fc = fd;
+                d = lo + gr * (hi - lo);
+                fd = eval_and_update(d, 3);
+            }
+            else {
+                hi = d;
+                d = c; fd = fc;
+                c = hi - gr * (hi - lo);
+                fc = eval_and_update(c, 3);
+            }
+        }
+        };
+    local_golden_refine(res.s_best, h0);
+
+    // compute Int(s) = Int1(s) - Int2(s)
+    // A) Int2 uses interpolation from Int1 (NO extra true evals).
+    auto compute_Int = [&](double s, bool refine, double target_h)->double {
+        if (refine) {
+            int1.ensure_local_resolution(s, target_h, [&](double sm) {
+                return eval_and_update(sm, 1); // Int1 refine
+                });
+        }
+
+        double total = int1.total_integral();
+        double left = int1.integral_to(s);
+        double Int1v = 2.0 * left - total;
+
+        double Int2v = 0.0;
+        for (int i = -COCP1_C; i <= COCP1_C; ++i) {
+            double si = s + (double)i * COCP1_DELTA / (double)COCP1_C;
+            if (si < SL || si > SU) continue;
+            double fN = int1.interp_val(si); // <- interpolation, no eval_line_pow
+            Int2v += ((double)i * COCP1_DELTA * fN) / ((double)COCP1_C * (double)COCP1_C);
+        }
+        return Int1v - Int2v;
+        };
+
+    // ---- Bracketing Int(s)=0 with few probes ----
+    double a = SL, b = SU;
+    double Ia = compute_Int(a, false, 0.0);
+    double Ib = compute_Int(b, false, 0.0);
+
+    auto try_bracket_with = [&](double x, double Ix)->bool {
+        if (Ia * Ix < 0.0) { b = x; Ib = Ix; return true; }
+        if (Ix * Ib < 0.0) { a = x; Ia = Ix; return true; }
+        return false;
+        };
+
+    bool bracket = (Ia == 0.0) || (Ib == 0.0) || (Ia * Ib < 0.0);
+    if (!bracket) {
+        double m = 0.5 * (SL + SU);
+        double Im = compute_Int(m, false, 0.0);
+        bracket = try_bracket_with(m, Im);
+        if (!bracket) {
+            double q1 = SL + 0.25 * (SU - SL);
+            double q3 = SL + 0.75 * (SU - SL);
+            double Iq1 = compute_Int(q1, false, 0.0);
+            bracket = try_bracket_with(q1, Iq1);
+            if (!bracket) {
+                double Iq3 = compute_Int(q3, false, 0.0);
+                bracket = try_bracket_with(q3, Iq3);
+            }
+        }
+    }
+
+    // If no bracket, return best found by (coarse + local refine)
+    if (!bracket) {
+        return res;
+    }
+    if (Ia == 0.0 || Ib == 0.0) {
+        return res;
+    }
+
+    // ---- Bisection with lazy Int1 refinement near mid ----
+    double hmin = std::sqrt(COCP1_DELTA) / COCP1_HMIN_FACTOR;
+
+    for (int it = 0; it < COCP1_MAX_BISECT; ++it) {
+        double mid = 0.5 * (a + b);
+        double w = b - a;
+
+        double target_h = std::max({ hmin, COCP1_TOL_S, w / 32.0 });
+        double Im = compute_Int(mid, true, target_h);
+
+        if (w <= COCP1_TOL_S) {
+            res.bisection_iters = it + 1;
+            break;
+        }
+        if (Ia * Im < 0.0) {
+            b = mid; Ib = Im;
+        }
+        else {
+            a = mid; Ia = Im;
+        }
+        res.bisection_iters = it + 1;
+    }
+
+    return res;
+}
+
+// ====================== Powell (maximize base) ======================
+struct PowellResult {
+    Vec x_best;
+    double base_best;
+    int iters;
+};
+
+static void print_vec(const char* name, const Vec& x) {
+    std::printf("%s = [", name);
+    for (int i = 0; i < DIM; i++) {
+        std::printf("%s%.6f", (i ? ", " : ""), x[i]);
+    }
+    std::printf("]\n");
+}
+static void print_sep() { std::printf("------------------------------------------------------------\n"); }
+
+// random orthonormal direction set (generic restart)
+static void random_orthonormal_dirs(std::mt19937& rng, std::array<Vec, DIM>& dirs) {
+    // IMPORTANT: do NOT allocate std::array<Vec,DIM> locally here.
+    // For large DIM (e.g., 500), a local std::array<Vec,DIM> is ~2MB and will overflow
+    // Visual Studio's default stack (especially in Debug). We fill the caller-provided
+    // container in-place.
+
+    std::normal_distribution<double> nd(0.0, 1.0);
+
+    for (int i = 0; i < DIM; i++) {
+        Vec v{};
+        for (int j = 0; j < DIM; j++) v[j] = nd(rng);
+
+        // Gram–Schmidt
+        for (int k = 0; k < i; k++) {
+            double proj = dotv(v, dirs[k]); // dirs[k] already normalized
+            for (int j = 0; j < DIM; j++) v[j] -= proj * dirs[k][j];
+        }
+
+        double n = normv(v);
+        if (n < 1e-12) {
+            v.fill(0.0);
+            v[i] = 1.0;
+            n = 1.0;
+        }
+        for (int j = 0; j < DIM; j++) v[j] /= n;
+
+        dirs[i] = v;
+    }
+}
+
+
+static PowellResult Powell_COCP1_Maximize_FullLog(Vec x0, int max_iters) {
+    double tol_step = 1e-5;  // tighter; but we won't stop immediately on stall (restart first)
+    double tol_base = 1e-6;
+
+    // initial directions: standard basis
+    //std::array<Vec, DIM> dirs;
+    //std::vector<std::array<double, DIM>> dirs(DIM); // 堆分配，连续存储
+    //std::vector<Vec> dirs(DIM);   // 堆上，连续存储
+    static std::array<Vec, DIM> dirs;  // ✅ 静态存储区，不占用函数栈
+    for (int i = 0; i < DIM; i++) {
+        Vec d{}; d.fill(0.0);
+        d[i] = 1.0;
+        dirs[i] = d;
+    }
+
+    Vec x = x0;
+    double b = base_objective(x);
+
+    Vec x_best = x;
+    double b_best = b;
+
+    std::mt19937 rng(1234567);
+    int restarts = 0;
+    const int MAX_RESTARTS = 2;
+
+    print_sep();
+    std::printf("Powell + COCP1(bisection+lazy Int1) line search\n");
+    std::printf("LineSearch internal uses pow(base, POWER_N)\n");
+    std::printf("Powell/log/stop uses base_objective\n");
+    std::printf("Generic fixes: Int2 interpolation + local refine + Powell restart\n");
+    print_vec("x0", x0);
+    std::printf("base(x0) = %.15e\n", b);
+    print_sep();
+
+    for (int iter = 0; iter < max_iters; ++iter) {
+        Vec x_start = x;
+        double b_start = b;
+
+        double best_improve = 0.0;
+        int imax = -1;
+
+        std::printf("[Iter %d] begin: base=%.15e\n", iter, b);
+
+        // line search along each direction
+        for (int i = 0; i < DIM; i++) {
+            Vec d_unit = normalize(dirs[i]);
+            if (normv(d_unit) < 1e-14) {
+                std::printf("  dir %2d: skip (zero direction)\n", i);
+                continue;
+            }
+
+            double b_old = b;
+
+            LineSearchResult ls = LineSearch_COCP1_BisectLazy(x, d_unit);
+            Vec x_new = ls.x_best;
+            double b_new = ls.base_best; // no re-eval
+
+            double improve = b_new - b_old;
+            if (improve > best_improve) {
+                best_improve = improve;
+                imax = i;
+            }
+
+            x = x_new;
+            b = b_new;
+
+            if (b > b_best) {
+                b_best = b;
+                x_best = x;
+            }
+
+            //std::printf("  dir %2d: base_old=%.15e -> base_new=%.15e  (Δ=%.3e, bisect=%d)\n",
+                //i, b_old, b_new, improve, ls.bisection_iters);
+        }
+
+        Vec d_new = subv(x, x_start);
+        double step_norm = normv(d_new);
+        double delta_b = b - b_start;
+
+        std::printf("[Iter %d] end(before extra): base=%.15e  Δbase=%.3e  ||Δx||=%.3e\n",
+            iter, b, delta_b, step_norm);
+
+        // If stalled: do generic restart instead of stopping immediately
+        if (std::fabs(delta_b) < tol_base && step_norm < tol_step) {
+            if (restarts < MAX_RESTARTS) {
+                ++restarts;
+                std::printf("  [Iter %d] STALL detected -> RESTART #%d (random orthonormal directions)\n",
+                    iter, restarts);
+                x = x_best;               // restart from global best
+                b = base_objective(x);
+                random_orthonormal_dirs(rng, dirs);
+                print_sep();
+                continue; // go next iteration
+            }
+            else {
+                print_sep();
+                std::printf("STOP (stall persists after %d restarts)\n", restarts);
+                print_vec("x_best", x_best);
+                std::printf("base_best = %.15e\n", b_best);
+                print_sep();
+                return { x_best, b_best, iter + 1 };
+            }
+        }
+
+        // extra line search along new direction
+        if (step_norm >= 1e-7) {
+            double b_before = b;
+            Vec d_new_unit = normalize(d_new);
+
+            LineSearchResult ls2 = LineSearch_COCP1_BisectLazy(x, d_new_unit);
+            x = ls2.x_best;
+            b = ls2.base_best;
+
+            if (b > b_best) {
+                b_best = b;
+                x_best = x;
+            }
+
+            std::printf("[Iter %d] extra(d_new): base=%.15e -> %.15e (Δ=%.3e, bisect=%d)\n",
+                iter, b_before, b, (b - b_before), ls2.bisection_iters);
+        }
+        else {
+            std::printf("[Iter %d] extra skipped: d_new nearly zero\n", iter);
+        }
+
+        // update directions (replace the most improving one)
+        if (imax < 0) imax = 0;
+        for (int j = imax; j < DIM - 1; ++j) dirs[j] = dirs[j + 1];
+        dirs[DIM - 1] = normalize(d_new);
+
+        std::printf("[Iter %d] replace dir imax=%d, last=normalize(x_end-x_start)\n", iter, imax);
+        std::printf("[Iter %d] end: base=%.15e  (global best=%.15e)\n", iter, b, b_best);
+        print_sep();
+    }
+
+    print_sep();
+    std::printf("MAX_ITERS reached\n");
+    print_vec("x_best", x_best);
+    std::printf("base_best = %.15e\n", b_best);
+    print_sep();
+    return { x_best, b_best, max_iters };
+}
+
+// ====================== Demo main ======================
+int main() {
+    std::srand(12345);
+
+    Vec x0;
+    for (int i = 0; i < DIM; i++) {
+        x0[i] = -0.5 + 0.0002 * i; // your fixed init
+    }
+    // ---- timing start ----
+    auto t0 = std::chrono::steady_clock::now();
+
+    auto res = Powell_COCP1_Maximize_FullLog(x0, Max_iters);
+
+    // ---- timing end ----
+    auto t1 = std::chrono::steady_clock::now();
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+
+    std::printf("FINAL: base_best=%.15e\n", res.base_best);
+    std::printf("samples(cnt)=%.15e\n", (double)cnt);
+
+    std::printf("breakdown (TRUE eval counts):\n");
+    std::printf("  Int1 init   = %lld\n", f_calls_int1_init);
+    std::printf("  Int1 refine = %lld\n", f_calls_int1_refine);
+    std::printf("  misc        = %lld\n", f_calls_misc);
+    std::printf("  Int2        = 0 (uses Int1 interpolation, no true evals)\n");
+
+    // print timing
+    std::printf("time(sec)=%.6f\n", sec);
+    std::printf("evals_per_sec=%.3f\n", (sec > 0.0 ? ((double)cnt / sec) : 0.0));
+
+    return 0;
+}
+
+
+// 运行程序: Ctrl + F5 或调试 >“开始执行(不调试)”菜单
+// 调试程序: F5 或调试 >“开始调试”菜单
+
+// 入门使用技巧: 
+//   1. 使用解决方案资源管理器窗口添加/管理文件
+//   2. 使用团队资源管理器窗口连接到源代码管理
+//   3. 使用输出窗口查看生成输出和其他消息
+//   4. 使用错误列表窗口查看错误
+//   5. 转到“项目”>“添加新项”以创建新的代码文件，或转到“项目”>“添加现有项”以将现有代码文件添加到项目
+//   6. 将来，若要再次打开此项目，请转到“文件”>“打开”>“项目”并选择 .sln 文件
