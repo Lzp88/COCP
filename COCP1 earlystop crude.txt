@@ -1,0 +1,104 @@
+   #include <stdio.h>
+#include <math.h>
+
+#define N 7.0 //Power
+//#define S 400 //Global sample # for Int1, S>= 2*K/DELTA
+#define C 10.0 //Sample # for incremental int
+#define K 2.1 //Range
+#define T 500 //Steps
+#define DELTA 0.01 //Gradient descent gap
+#define EARLYSTOP 250 //Early stop control
+
+//Initial int1 should be calculated more crudely to avoid degenerating into random sampling.For trapzoid, d=sqrt(DELTA) should be enough. 
+
+
+// Function: f(x)=-log((x-0.5)^2+0.00001)-log((x +0.5)^2+0.01) on [-0.2, 1.6]
+
+double f(double x) {
+    if (x < -K || x > K) {
+        return 0.0; // Outside range
+    }
+    //double val = 1.5 - log(pow(x - 0.5, 2.0) + 0.0001) - log(pow(x + 0.5, 2.0) + 0.01);
+    double val = 1.5 - 3.0 * pow(x, 4.0) + 15.0 * pow(x, 2.0) + 5.0 * x;
+    if (val < 0.0) {return 0.0;}
+    else {return pow(val, N);}
+    // Inside range
+}
+
+// Main function
+int main() {
+    double x_t = -1.9; // Initialize x_0
+    double Int1 = 0.0, Int2 = 0.0, Int3 = 0.0, Int = 0.0;
+    double bestx = x_t;
+    double bestf = pow(f(bestx), 1.0/N);
+    int noimprove = 0;
+    int t, l;
+    double d=pow(DELTA, 0.5); // scale for initial int1
+    // Calculate Int1
+    for (int i = 0; i < 2 * K/d; ++i) { // Large range to approximate infinity
+        double term1l=0.0, term1r=0.0, term2l=0.0, term2r=0.0;
+        if (x_t-i * d >=-K) term1l= f(x_t-i * d);
+        if (x_t-(i+1) * d >=-K) term1r = f(x_t-(i+1) * d);
+        if (x_t+i * d <= K) term2l = f(x_t+i * d);
+        if (x_t+(i+1) * d <= K) term2r = f(x_t+(i+1) * d);
+        //if (term1 != 0.0) 
+          Int1 += d * (term1l+term1r) /2.0;
+        //if (term2 != 0.0) 
+          Int1 -= d * (term2l+term2r)/2.0;
+    }
+
+    // Calculate Int2
+    for (int i = -C; i <= C; ++i) {
+        double xi = i * DELTA / C;
+        //if (xi >= -K && xi <= K) { // Ensure xi is within range
+            Int2 += (i * DELTA* f(x_t+xi)) / (C * C);
+        //}
+    }
+
+    Int = Int1 - Int2;
+
+    // Iterative updates
+    for (t = 0; t < T; ++t) {
+        double y=x_t;
+        x_t -= DELTA * copysign(1.0, Int);
+        if (pow(f(x_t), 1.0/N)> bestf){bestx=x_t; bestf = pow(f(x_t), 1.0/N); noimprove = 0;}
+      else {noimprove += 1; if (noimprove >= EARLYSTOP) break;}
+ 
+        // Update Int1
+        Int1 = 0.0;
+        for (int i = 1; i <= C; ++i) {
+            double xi = x_t + DELTA + i * DELTA/C;
+            double yi= y - DELTA + i * DELTA/C;
+            //if (xi >= -K && xi <= K) { // Ensure xi is within range
+                Int1 += copysign(1.0, Int) * DELTA/C * f(xi) 
+                + copysign(1.0, Int) * DELTA/C * f(yi);
+            //}
+        }
+
+        // Update Int3 and Int2
+        Int3 = Int2;
+        Int2 = 0.0;
+        for (int i = -C; i <= C; ++i) {
+            double shifted_x = x_t + i * DELTA / C;
+            //if (shifted_x >= -K && shifted_x <= K) { 
+            // Ensure shifted_x is within range
+                Int2 += (i * DELTA* f(shifted_x)) / (C * C);
+           // }
+        }
+
+        // Update Int
+        Int = Int - Int1 - Int2 + Int3;
+         //printf("Iteration %d: x_t = %f\n", t, x_t);
+     
+      
+    }
+    if (t == T) {l = T;}
+    else {l = t+1;}
+    // Print the final result
+    printf("Stopped at iteration: %f\n", (double)t);
+    printf("Best value achieved at iteration: %f\n", (double)(l-EARLYSTOP));
+    printf("Best value of x_t: %f\n", bestx);
+    printf("Best value of function: %f\n", bestf);
+
+    return 0;
+}
